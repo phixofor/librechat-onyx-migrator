@@ -8,7 +8,7 @@ import secrets
 import shutil
 import sys
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -266,6 +266,76 @@ def _analyze_branching(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "branch_points": branching_points,
         "missing_parent_ids": sorted(missing_parent_ids),
     }
+
+
+def _split_messages_into_branches(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Return a list of linear message sequences, one per branch."""
+    id_to_msg: dict[str, dict[str, Any]] = {}
+    order_index: dict[str, int] = {}
+    for idx, message in enumerate(messages):
+        msg_id = message.get("messageId")
+        if not msg_id:
+            continue
+        id_to_msg[msg_id] = message
+        order_index[msg_id] = idx
+
+    if not id_to_msg:
+        return []
+
+    children: dict[str, list[str]] = defaultdict(list)
+    roots: list[str] = []
+    for message in messages:
+        msg_id = message.get("messageId")
+        if not msg_id:
+            continue
+        parent_id = message.get("parentMessageId")
+        if parent_id and parent_id in id_to_msg:
+            children[parent_id].append(msg_id)
+        else:
+            roots.append(msg_id)
+
+    if not roots:
+        # Fallback: treat the earliest message as the root
+        roots = (
+            [messages[0]["messageId"]]
+            if messages and messages[0].get("messageId")
+            else list(id_to_msg.keys())
+        )
+
+    def dfs(current_id: str, current_path: list[str]) -> list[list[str]]:
+        new_path = current_path + [current_id]
+        child_ids = children.get(current_id)
+        if not child_ids:
+            return [new_path]
+        ordered_children = sorted(child_ids, key=lambda cid: order_index.get(cid, 0))
+        paths: list[list[str]] = []
+        for child_id in ordered_children:
+            paths.extend(dfs(child_id, new_path))
+        return paths
+
+    ordered_roots = sorted(set(roots), key=lambda rid: order_index.get(rid, 0))
+    branch_id_paths: list[list[str]] = []
+    seen_paths: set[tuple[str, ...]] = set()
+    for root_id in ordered_roots:
+        for path in dfs(root_id, []):
+            path_key = tuple(path)
+            if path_key not in seen_paths:
+                seen_paths.add(path_key)
+                branch_id_paths.append(path)
+
+    if not branch_id_paths:
+        return []
+
+    variants: list[list[dict[str, Any]]] = []
+    for path in branch_id_paths:
+        path_ids = set(path)
+        variant_messages: list[dict[str, Any]] = []
+        for message in messages:
+            msg_id = message.get("messageId")
+            if not msg_id or msg_id in path_ids:
+                variant_messages.append(message)
+        variants.append(variant_messages)
+    return variants
 
 
 def _gather_asset_roots(args) -> list[Path]:
@@ -756,7 +826,8 @@ def import_chats(args):
                 files_index[file_id] = entry
 
     dry_run = args.dry_run
-    skip_branching = args.skip_branching
+    split_branches = getattr(args, "split_branches", False)
+    skip_branching = args.skip_branching and not split_branches
     upload_files = not args.no_upload_files
     api_base = (args.api_base or os.environ.get("ONYX_API_BASE") or "").rstrip("/")
     upload_session: requests.Session | None = None
@@ -797,6 +868,7 @@ def import_chats(args):
         "files_uploaded": 0,
         "files_missing": 0,
         "files_skipped": 0,
+        "branches_split": 0,
     }
 
     uploaded_files: dict[str, dict[str, Any] | None] = {}
@@ -920,130 +992,177 @@ def import_chats(args):
         conversation = record.get("conversation") or {}
         messages = record.get("messages") or []
         branch_info = record.get("branching") or {}
+        has_branching = bool(branch_info.get("has_branching"))
 
-        if branch_info.get("has_branching") and skip_branching:
+        if has_branching and skip_branching:
             stats["skipped_branching"] += 1
             continue
 
-        conversation_uuid = _safe_uuid(conversation.get("conversationId"))
+        conversation_uuid_obj = _safe_uuid(conversation.get("conversationId"))
+        conversation_uuid_str = str(conversation_uuid_obj)
         description = (
             conversation.get("title")
             or conversation.get("greeting")
-            or f"Imported chat {conversation_uuid}"
+            or f"Imported chat {conversation_uuid_str}"
         )
         created_at = _parse_iso_datetime(conversation.get("createdAt"))
         updated_at = _parse_iso_datetime(conversation.get("updatedAt"))
         deleted = bool(conversation.get("isArchived"))
         shared_status = "PUBLIC" if conversation.get("shared") else "PRIVATE"
         persona_id = args.persona_id if args.persona_id is not None else 0
-        llm_override = _chat_metadata_payload(conversation)
-        prompt_override = {
-            "librechat": {
-                "promptPrefix": conversation.get("promptPrefix"),
-                "greeting": conversation.get("greeting"),
-                "tags": conversation.get("tags"),
-                "web_search": conversation.get("web_search"),
-                "temperature": conversation.get("temperature"),
-                "top_p": conversation.get("top_p"),
-            }
-        }
         current_alternate_model = conversation.get("model")
         temperature_override = conversation.get("temperature")
+        branch_variants: list[list[dict[str, Any]]] = [messages]
+        branch_context = False
+        if has_branching and split_branches:
+            split_variants = _split_messages_into_branches(messages)
+            if split_variants:
+                branch_variants = split_variants
+                if len(split_variants) > 1:
+                    branch_context = True
+                    stats["branches_split"] += len(split_variants)
+            else:
+                print(
+                    "[warn] Unable to derive branches for conversation "
+                    f"{conversation.get('conversationId')}; importing full thread instead."
+                )
 
-        if dry_run:
-            stats["dry_run_conversations"] += 1
-            print(
-                f"[dry-run] Would import conversation {conversation_uuid} "
-                f"({len(messages)} messages, created {created_at.isoformat()})"
+        for idx, variant_messages in enumerate(branch_variants, start=1):
+            is_branch = branch_context
+            branch_index = idx if branch_context else None
+            branch_total = len(branch_variants) if branch_context else None
+            if branch_context:
+                variant_uuid_obj = uuid.uuid5(
+                    conversation_uuid_obj, f"branch-{idx}"
+                )
+                description_suffix = f" (branch #{idx})"
+            else:
+                variant_uuid_obj = conversation_uuid_obj
+                description_suffix = ""
+            variant_uuid_str = str(variant_uuid_obj)
+
+            llm_override = _chat_metadata_payload(conversation)
+            prompt_override = {
+                "librechat": {
+                    "promptPrefix": conversation.get("promptPrefix"),
+                    "greeting": conversation.get("greeting"),
+                    "tags": conversation.get("tags"),
+                    "web_search": conversation.get("web_search"),
+                    "temperature": conversation.get("temperature"),
+                    "top_p": conversation.get("top_p"),
+                }
+            }
+            if branch_context:
+                llm_override.setdefault("librechat", {})["branch"] = {
+                    "index": branch_index,
+                    "total": branch_total,
+                }
+                prompt_override.setdefault("librechat", {})["branch"] = {
+                    "index": branch_index,
+                    "total": branch_total,
+                }
+
+            if dry_run:
+                stats["dry_run_conversations"] += 1
+                label = (
+                    f"{variant_uuid_str} (branch #{branch_index})"
+                    if is_branch
+                    else variant_uuid_str
+                )
+                print(
+                    f"[dry-run] Would import conversation {label} "
+                    f"({len(variant_messages)} messages, created {created_at.isoformat()})"
+                )
+                continue
+
+            cursor.execute(
+                "SELECT 1 FROM chat_session WHERE id = %s",
+                (variant_uuid_str,),
             )
-            continue
+            if cursor.fetchone():
+                stats["skipped_existing"] += 1
+                continue
 
-        cursor.execute(
-            "SELECT 1 FROM chat_session WHERE id = %s",
-            (str(conversation_uuid),),
-        )
-        if cursor.fetchone():
-            stats["skipped_existing"] += 1
-            continue
-
-        cursor.execute(
-            """
-            INSERT INTO chat_session (
-                id, user_id, description, deleted, shared_status,
-                time_created, time_updated, persona_id, llm_override,
-                prompt_override, onyxbot_flow, current_alternate_model,
-                temperature_override, project_id
-            ) VALUES (
-                %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
-                %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
-                %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
-                %(temperature_override)s, %(project_id)s
+            cursor.execute(
+                """
+                INSERT INTO chat_session (
+                    id, user_id, description, deleted, shared_status,
+                    time_created, time_updated, persona_id, llm_override,
+                    prompt_override, onyxbot_flow, current_alternate_model,
+                    temperature_override, project_id
+                ) VALUES (
+                    %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
+                    %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
+                    %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
+                    %(temperature_override)s, %(project_id)s
+                )
+                """,
+                {
+                    "id": variant_uuid_str,
+                    "user_id": user_id,
+                    "description": description + description_suffix,
+                    "deleted": deleted,
+                    "shared_status": shared_status,
+                    "time_created": created_at,
+                    "time_updated": updated_at,
+                    "persona_id": persona_id,
+                    "llm_override": json.dumps(llm_override),
+                    "prompt_override": json.dumps(prompt_override),
+                    "onyxbot_flow": False,
+                    "current_alternate_model": current_alternate_model,
+                    "temperature_override": temperature_override,
+                    "project_id": None,
+                },
             )
-            """,
-            {
-                "id": str(conversation_uuid),
-                "user_id": user_id,
-                "description": description,
-                "deleted": deleted,
-                "shared_status": shared_status,
-                "time_created": created_at,
-                "time_updated": updated_at,
-                "persona_id": persona_id,
-                "llm_override": json.dumps(llm_override),
-                "prompt_override": json.dumps(prompt_override),
-                "onyxbot_flow": False,
-                "current_alternate_model": current_alternate_model,
-                "temperature_override": temperature_override,
-                "project_id": None,
-            },
-        )
 
-        session_intro = (
-            f"Imported from LibreChat conversation {conversation.get('conversationId')} "
-            f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
-        )
-        cursor.execute(
-            """
-            INSERT INTO chat_message (
-                message, message_type, time_sent, token_count,
-                parent_message, chat_session_id, citations, files,
-                error, rephrased_query, alternate_assistant_id,
-                overridden_model, is_agentic
+            session_intro = (
+                f"Imported from LibreChat conversation {conversation.get('conversationId')} "
+                f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                session_intro,
-                "SYSTEM",
-                created_at,
-                0,
-                None,
-                str(conversation_uuid),
-                json.dumps({}),
-                None,
-                None,
-                None,
-                None,
-                conversation.get("model"),
-                False,
-            ),
-        )
-        row = cursor.fetchone()
-        system_message_id = row["id"] if isinstance(row, dict) else row[0]
+            if is_branch:
+                session_intro += f" Branch #{branch_index} of {branch_total}."
+            cursor.execute(
+                """
+                INSERT INTO chat_message (
+                    message, message_type, time_sent, token_count,
+                    parent_message, chat_session_id, citations, files,
+                    error, rephrased_query, alternate_assistant_id,
+                    overridden_model, is_agentic
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    session_intro,
+                    "SYSTEM",
+                    created_at,
+                    0,
+                    None,
+                    variant_uuid_str,
+                    json.dumps({}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    conversation.get("model"),
+                    False,
+                ),
+            )
+            row = cursor.fetchone()
+            system_message_id = row["id"] if isinstance(row, dict) else row[0]
 
-        message_id_map: dict[str, int] = {}
-        previous_id = system_message_id
+            message_id_map: dict[str, int] = {}
+            previous_id = system_message_id
 
-        for message in messages:
-            message_id = message.get("messageId")
-            time_sent = _parse_iso_datetime(message.get("createdAt"))
-            message_type = "USER" if message.get("isCreatedByUser") else "ASSISTANT"
-            text = _message_text_from_record(message)
-            if not text:
-                text = "(empty message)"
-            token_count = int(message.get("tokenCount") or 0)
-            parent_ext_id = message.get("parentMessageId")
+            for message in variant_messages:
+                message_id = message.get("messageId")
+                time_sent = _parse_iso_datetime(message.get("createdAt"))
+                message_type = "USER" if message.get("isCreatedByUser") else "ASSISTANT"
+                text = _message_text_from_record(message)
+                if not text:
+                    text = "(empty message)"
+                token_count = int(message.get("tokenCount") or 0)
+                parent_ext_id = message.get("parentMessageId")
             parent_id = None
             if (
                 parent_ext_id
@@ -1101,7 +1220,7 @@ def import_chats(args):
                     time_sent,
                     token_count,
                     parent_id,
-                    str(conversation_uuid),
+                    variant_uuid_str,
                     json.dumps(citations_payload),
                     json.dumps(message_files_payload) if message_files_payload else None,
                     str(message.get("error")) if message.get("error") else None,
@@ -1129,9 +1248,9 @@ def import_chats(args):
                     (inserted_id, parent_id),
                 )
 
-        stats["imported"] += 1
-        if conn:
-            conn.commit()
+            stats["imported"] += 1
+            if conn:
+                conn.commit()
 
     if cursor:
         cursor.close()
@@ -1431,6 +1550,11 @@ def main():
         action="store_true",
         default=True,
         help="Skip conversations that contain branching threads (default: true)",
+    )
+    import_cmd.add_argument(
+        "--split-branches",
+        action="store_true",
+        help="Import branched LibreChat conversations as separate Onyx sessions.",
     )
     import_cmd.add_argument(
         "--persona-id",

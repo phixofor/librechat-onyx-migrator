@@ -10,3 +10,6 @@ AGENTS.md
 .env
 .github/
 .gitattributes
+all_users.txt
+batch_*
+dry-run.txt

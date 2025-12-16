@@ -77,7 +77,8 @@ Drop `--dry-run` once satisfied. Key flags:
 - `--db-host/port/user/password` override the Postgres connection (defaults pull from env).
 - `--api-base` overrides `ONYX_API_BASE` if you need to point at a different Onyx host for attachment ingestion.
 - `--no-upload-files` skips attachment handling if you only care about text.
-- `--skip-branching` (default true) ignores conversations that contain branching message trees. Remove it once you’re ready to split/duplicate those chats.
+- `--skip-branching` (default true) ignores conversations that contain branching message trees.
+- `--split-branches` imports each branch as its own chat session (e.g., “(branch #2)”) so nothing is skipped.
 
 The importer currently:
 - inserts a synthetic SYSTEM message per chat to capture LibreChat metadata in `llm_override` / `prompt_override`.
