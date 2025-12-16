@@ -11,7 +11,7 @@ Environment
 -----------
 1. Copy `.env.example` to `.env` (or reuse an existing file) so the following variables are available:
    - `LIBRECHAT_MONGODB` – Mongo connection string (e.g. `mongodb://127.0.0.1:27018/LibreChat`).  
-     If the default hostname `mongodb.librechat.orb.local` is unreachable from your shell, override this env var when running commands.
+     If the default hostname `mongodb.librechat.local` is unreachable from your shell, override this env var when running commands.
    - `ONYX_API_BASE` / `ONYX_API_KEY` – required for the user-creation flow **and** for attachment ingestion during imports (files are uploaded via the Onyx API).
 2. Optional: provide extra attachment roots so the exporter can locate binary files:
    - `LIBRECHAT_ASSET_ROOTS=/path/to/LibreChat/uploads:/path/to/LibreChat/images`
@@ -92,7 +92,7 @@ Batch exporting + importing every user
    import os
    from pymongo import MongoClient
 
-   mongo_uri = os.environ.get("LIBRECHAT_MONGODB", "mongodb://mongodb.librechat.orb.local:27017/")
+   mongo_uri = os.environ.get("LIBRECHAT_MONGODB", "mongodb://mongodb.librechat.local:27017/")
    client = MongoClient(mongo_uri, connect=False)
    db = client["LibreChat"]
    with open("all_users.txt", "w") as handle:
