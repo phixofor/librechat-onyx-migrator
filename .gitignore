@@ -1,0 +1,12 @@
+exports/
+exports_*/
+.DS_Store
+__pycache__/
+*.pyc
+deployment/docker-compose.override.yml
+.beads/
+*.jsonl
+AGENTS.md
+.env
+.github/
+.gitattributes
