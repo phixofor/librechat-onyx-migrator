@@ -183,3 +183,8 @@ Operational Notes
 - These scripts never delete or mutate LibreChat data; they only read via MongoDB and (optionally) copy files locally.
 - Always run exports against low-risk users first (e.g. `example.user@company.com`) before batching the rest.
 - Ensure the Onyx containers are running if you plan to reuse the resulting JSON with future import tooling (they provide the API + LLM configs referenced in planning).
+
+Development
+-----------
+- Install linting tools with `pip install ruff`.
+- Run `ruff check lc-mig.py` (optionally `--fix`) before committing to keep the single-file CLI tidy.

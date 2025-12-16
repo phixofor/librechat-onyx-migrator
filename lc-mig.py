@@ -9,9 +9,10 @@ import shutil
 import sys
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any
 
 import requests
 from bson import ObjectId
@@ -28,7 +29,7 @@ except ImportError:  # pragma: no cover - optional dependency
 def load_env(path: str = ".env"):
     if not os.path.exists(path):
         return
-    with open(path, "r") as f:
+    with open(path) as f:
         for raw in f:
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -41,7 +42,7 @@ def load_env(path: str = ".env"):
             os.environ[key] = cleaned
 
 
-def get_session_headers(content_type: Optional[str] = "application/json"):
+def get_session_headers(content_type: str | None = "application/json"):
     api_key = os.environ.get("ONYX_API_KEY")
     if not api_key:
         raise RuntimeError("ONYX_API_KEY missing")
@@ -140,8 +141,11 @@ def create_users(args):
             total_created += 1
             print(f"Created user {user['email']}")
         except requests.HTTPError as http_err:
+            response_text = ""
+            if http_err.response is not None:
+                response_text = getattr(http_err.response, "text", "")
             print(
-                f"Failed to create {user['email']}: {http_err} {getattr(http_err, 'response', None).text}",
+                f"Failed to create {user['email']}: {http_err} {response_text}",
                 file=sys.stderr,
             )
     print(f"Done. Created {total_created} users. Credentials logged to {created_log}")
@@ -163,8 +167,8 @@ def _normalize_value(value: Any):
         return str(value)
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat()
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat()
     if isinstance(value, list):
         return [_normalize_value(v) for v in value]
     if isinstance(value, dict):
@@ -172,12 +176,12 @@ def _normalize_value(value: Any):
     return value
 
 
-def _normalize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_doc(doc: dict[str, Any]) -> dict[str, Any]:
     return {key: _normalize_value(value) for key, value in doc.items()}
 
 
-def _extract_message_file_ids(message: Dict[str, Any]) -> List[str]:
-    ids: List[str] = []
+def _extract_message_file_ids(message: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
 
     for entry in message.get("files") or []:
         fid = entry.get("file_id") or entry.get("fileId")
@@ -193,13 +197,13 @@ def _extract_message_file_ids(message: Dict[str, Any]) -> List[str]:
 
 
 def _resolve_file_path(
-    file_doc: Dict[str, Any], candidate_roots: List[Path]
-) -> Optional[Path]:
+    file_doc: dict[str, Any], candidate_roots: list[Path]
+) -> Path | None:
     raw_path = file_doc.get("filepath") or file_doc.get("path")
     filename = file_doc.get("filename")
     user_id = file_doc.get("user")
 
-    possible_paths: List[Path] = []
+    possible_paths: list[Path] = []
     if raw_path:
         raw_path = str(raw_path)
         path_obj = Path(raw_path)
@@ -225,7 +229,7 @@ def _resolve_file_path(
     return None
 
 
-def _sha256_of_file(path: Path) -> Optional[str]:
+def _sha256_of_file(path: Path) -> str | None:
     if not path or not path.is_file():
         return None
     digest = hashlib.sha256()
@@ -235,7 +239,7 @@ def _sha256_of_file(path: Path) -> Optional[str]:
     return digest.hexdigest()
 
 
-def _analyze_branching(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _analyze_branching(messages: list[dict[str, Any]]) -> dict[str, Any]:
     parent_counts: Counter[str] = Counter()
     seen_ids = set()
     missing_parent_ids = set()
@@ -247,7 +251,7 @@ def _analyze_branching(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         if parent_id:
             parent_counts[parent_id] += 1
 
-    for parent_id, count in parent_counts.items():
+    for parent_id, _count in parent_counts.items():
         if parent_id and parent_id not in seen_ids:
             missing_parent_ids.add(parent_id)
 
@@ -264,8 +268,8 @@ def _analyze_branching(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _gather_asset_roots(args) -> List[Path]:
-    roots: List[str] = []
+def _gather_asset_roots(args) -> list[Path]:
+    roots: list[str] = []
     env_roots = os.environ.get("LIBRECHAT_ASSET_ROOTS")
     if args.asset_root:
         roots.extend(args.asset_root)
@@ -346,7 +350,7 @@ def export_chats(args):
         files_dir = user_dir / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
 
-        all_files: Dict[str, Dict[str, Any]] = {}
+        all_files: dict[str, dict[str, Any]] = {}
 
         with conversations_path.open("w", encoding="utf-8") as convo_out:
             user_id_str = str(user.get("_id"))
@@ -379,8 +383,8 @@ def export_chats(args):
                         if fid
                     }
                 )
-                missing_file_ids: List[str] = []
-                file_payloads: List[str] = []
+                missing_file_ids: list[str] = []
+                file_payloads: list[str] = []
 
                 if file_ids:
                     for file_doc in db.files.find({"file_id": {"$in": file_ids}}):
@@ -395,7 +399,7 @@ def export_chats(args):
                         sha256 = (
                             _sha256_of_file(resolved_path) if resolved_path else None
                         )
-                        errors: List[str] = []
+                        errors: list[str] = []
                         copied_rel_path = None
 
                         if not resolved_path:
@@ -470,7 +474,7 @@ def _require_psycopg():
         )
 
 
-def _load_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
+def _load_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -479,28 +483,28 @@ def _load_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
             yield json.loads(line)
 
 
-def _parse_iso_datetime(value: Optional[str]) -> datetime:
+def _parse_iso_datetime(value: str | None) -> datetime:
     if not value:
-        return datetime.utcnow().replace(tzinfo=timezone.utc)
+        return datetime.utcnow().replace(tzinfo=UTC)
     if isinstance(value, datetime):
         dt = value
     else:
         cleaned = value.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
-def _to_naive(dt: Optional[datetime]) -> Optional[datetime]:
+def _to_naive(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.astimezone(UTC).replace(tzinfo=None)
     return dt
 
 
-def _safe_uuid(value: Optional[str]) -> uuid.UUID:
+def _safe_uuid(value: str | None) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
     if value:
@@ -511,7 +515,7 @@ def _safe_uuid(value: Optional[str]) -> uuid.UUID:
     return uuid.uuid4()
 
 
-def _coerce_text_value(value: Any) -> Optional[str]:
+def _coerce_text_value(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
@@ -519,7 +523,7 @@ def _coerce_text_value(value: Any) -> Optional[str]:
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, list):
-        pieces: List[str] = []
+        pieces: list[str] = []
         for item in value:
             piece = _coerce_text_value(item)
             if piece:
@@ -533,7 +537,7 @@ def _coerce_text_value(value: Any) -> Optional[str]:
             if candidate:
                 return candidate
         if "parts" in value and isinstance(value["parts"], list):
-            pieces: List[str] = []
+            pieces: list[str] = []
             for part in value["parts"]:
                 piece = _coerce_text_value(part)
                 if piece:
@@ -552,9 +556,9 @@ def _coerce_text_value(value: Any) -> Optional[str]:
 
 
 def _summarize_attachments(
-    attachments: Iterable[Dict[str, Any]], label: str
-) -> Optional[str]:
-    rows: List[str] = []
+    attachments: Iterable[dict[str, Any]], label: str
+) -> str | None:
+    rows: list[str] = []
     for attachment in attachments:
         if not isinstance(attachment, dict):
             continue
@@ -571,7 +575,7 @@ def _summarize_attachments(
             or attachment.get("mimeType")
         )
         size = attachment.get("bytes") or attachment.get("size")
-        extras: List[str] = []
+        extras: list[str] = []
         if content_type:
             extras.append(content_type)
         if size:
@@ -585,13 +589,13 @@ def _summarize_attachments(
     return f"{label}:\n" + "\n".join(rows)
 
 
-def _message_text_from_record(record: Dict[str, Any]) -> str:
+def _message_text_from_record(record: dict[str, Any]) -> str:
     base = record.get("text")
     if isinstance(base, str) and base.strip():
         return base
 
     content_entries = record.get("content") or []
-    parts: List[str] = []
+    parts: list[str] = []
     for entry in content_entries:
         entry_type = entry.get("type")
         if entry_type == "text":
@@ -641,7 +645,7 @@ def _message_text_from_record(record: Dict[str, Any]) -> str:
     return f"[empty message imported from LibreChat messageId={message_id}]"
 
 
-def _chat_metadata_payload(conversation: Dict[str, Any]) -> Dict[str, Any]:
+def _chat_metadata_payload(conversation: dict[str, Any]) -> dict[str, Any]:
     return {
         "librechat": {
             key: conversation.get(key)
@@ -666,7 +670,7 @@ def _chat_metadata_payload(conversation: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _message_metadata_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+def _message_metadata_payload(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "messageId": message.get("messageId"),
         "sender": message.get("sender"),
@@ -679,7 +683,7 @@ def _message_metadata_payload(message: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _guess_chat_file_type(content_type: Optional[str]) -> str:
+def _guess_chat_file_type(content_type: str | None) -> str:
     if not content_type:
         return "file"
     lowered = content_type.lower()
@@ -706,7 +710,7 @@ def _ensure_metadata_table(cursor):
     )
 
 
-def _resolve_file_source(bundle_root: Path, entry: Dict[str, Any]) -> Optional[Path]:
+def _resolve_file_source(bundle_root: Path, entry: dict[str, Any]) -> Path | None:
     rel_path = entry.get("copied_rel_path")
     if rel_path:
         candidate = bundle_root / rel_path
@@ -744,7 +748,7 @@ def import_chats(args):
             "Unable to infer user email from bundle. Pass --user-email explicitly."
         )
 
-    files_index: Dict[str, Dict[str, Any]] = {}
+    files_index: dict[str, dict[str, Any]] = {}
     if files_manifest_path.is_file():
         for entry in _load_jsonl(files_manifest_path):
             file_id = entry.get("file_id")
@@ -755,8 +759,8 @@ def import_chats(args):
     skip_branching = args.skip_branching
     upload_files = not args.no_upload_files
     api_base = (args.api_base or os.environ.get("ONYX_API_BASE") or "").rstrip("/")
-    upload_session: Optional[requests.Session] = None
-    upload_url: Optional[str] = None
+    upload_session: requests.Session | None = None
+    upload_url: str | None = None
     upload_timeout = float(os.environ.get("ONYX_UPLOAD_TIMEOUT_SECONDS", 120))
     if upload_files and not dry_run:
         if not api_base:
@@ -774,7 +778,7 @@ def import_chats(args):
         cursor = conn.cursor()
         _ensure_metadata_table(cursor)
 
-    user_id: Optional[str] = None
+    user_id: str | None = None
     if cursor:
         cursor.execute('SELECT id FROM "user" WHERE email = %s', (target_email,))
         row = cursor.fetchone()
@@ -795,9 +799,9 @@ def import_chats(args):
         "files_skipped": 0,
     }
 
-    uploaded_files: Dict[str, Optional[Dict[str, Any]]] = {}
+    uploaded_files: dict[str, dict[str, Any] | None] = {}
 
-    def get_or_upload_file(file_id: str) -> Optional[Dict[str, Any]]:
+    def get_or_upload_file(file_id: str) -> dict[str, Any] | None:
         if file_id in uploaded_files:
             return uploaded_files[file_id]
 
@@ -1028,7 +1032,7 @@ def import_chats(args):
         row = cursor.fetchone()
         system_message_id = row["id"] if isinstance(row, dict) else row[0]
 
-        message_id_map: Dict[str, int] = {}
+        message_id_map: dict[str, int] = {}
         previous_id = system_message_id
 
         for message in messages:
@@ -1050,10 +1054,10 @@ def import_chats(args):
             else:
                 parent_id = previous_id
             metadata_blob = _message_metadata_payload(message)
-            citations_payload: Dict[str, Any] = {}
-            message_files_payload: List[Dict[str, Any]] = []
+            citations_payload: dict[str, Any] = {}
+            message_files_payload: list[dict[str, Any]] = []
             if upload_files:
-                file_sources: List[str] = []
+                file_sources: list[str] = []
                 for field in ("files", "attachments"):
                     for entry in message.get(field) or []:
                         file_identifier = (
@@ -1144,7 +1148,7 @@ def repair_latest_child(args):
     conn = _connect_postgres(args)
     cursor = conn.cursor()
 
-    session_ids: List[str] = []
+    session_ids: list[str] = []
     if args.chat_session_id:
         session_ids.append(args.chat_session_id)
     elif args.user_email:
@@ -1187,7 +1191,7 @@ def repair_latest_child(args):
             (session_id,),
         )
         rows = cursor.fetchall()
-        parent_children: Dict[int, List[int]] = {}
+        parent_children: dict[int, list[int]] = {}
         for row in rows:
             parent_id = row["parent_message"] if isinstance(row, dict) else row[1]
             child_id = row["id"] if isinstance(row, dict) else row[0]
@@ -1214,7 +1218,7 @@ def repair_citations(args):
     cursor = conn.cursor()
 
     filter_clause = ""
-    filter_params: List[Any] = []
+    filter_params: list[Any] = []
 
     if args.chat_session_id:
         filter_clause = "WHERE id = %s"
@@ -1270,7 +1274,7 @@ def repair_message_text(args):
     cursor = conn.cursor()
 
     filter_clause = ""
-    filter_params: List[Any] = []
+    filter_params: list[Any] = []
 
     if args.chat_session_id:
         filter_clause = "WHERE id = %s"
@@ -1477,7 +1481,10 @@ def main():
 
     repair_citations_cmd = sub.add_parser(
         "repair-citations",
-        help="Remove legacy LibreChat metadata from chat_message.citations so sessions load correctly",
+        help=(
+            "Remove legacy LibreChat metadata from chat_message.citations "
+            "so sessions load correctly"
+        ),
     )
     repair_citations_cmd.add_argument(
         "--chat-session-id",
