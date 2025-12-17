@@ -4,8 +4,10 @@ LibreChat → Onyx Migrator
 This utility repo contains small Python helpers that support the LibreChat → Onyx migration workstream.  
 All scripts are read-only with respect to LibreChat/Onyx data—only new export artifacts are created on disk.
 
-Made with Codex, by OpenAI  
+Made with Codex by OpenAI  
 https://github.com/openai/codex
+
+This project is "feature" complete from my perspective. Feel free to fork and adjust to your pleasure. 
 
 Environment
 -----------
