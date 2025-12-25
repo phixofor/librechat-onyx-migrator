@@ -6,10 +6,12 @@ __pycache__/
 deployment/docker-compose.override.yml
 .beads/
 *.jsonl
-AGENTS.md
+# Keep AI agent guidelines out of git unless explicitly added with -f
+# AGENTS.md
 .env
 .github/
 .gitattributes
 all_users.txt
 batch_*
 dry-run.txt
+live-run.txt
