@@ -1251,8 +1251,8 @@ def import_chats(args):
                     )
 
                 stats["imported"] += 1
-                if conn:
-                    conn.commit()
+            if conn:
+                conn.commit()
 
     if cursor:
         cursor.close()
