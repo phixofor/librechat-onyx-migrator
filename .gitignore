@@ -7,6 +7,7 @@ deployment/docker-compose.override.yml
 *.jsonl
 /.beads/*
 !/.beads/issues.jsonl
+!/.beads/.gitignore
 # Keep AI agent guidelines out of git unless explicitly added with -f
 # AGENTS.md
 .env
