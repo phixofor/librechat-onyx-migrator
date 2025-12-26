@@ -26,6 +26,9 @@ except ImportError:  # pragma: no cover - optional dependency
     dict_row = None
 
 
+NULL_UUID = "00000000-0000-0000-0000-000000000000"
+
+
 def load_env(path: str = ".env"):
     if not os.path.exists(path):
         return
@@ -183,15 +186,11 @@ def _normalize_doc(doc: dict[str, Any]) -> dict[str, Any]:
 def _extract_message_file_ids(message: dict[str, Any]) -> list[str]:
     ids: list[str] = []
 
-    for entry in message.get("files") or []:
-        fid = entry.get("file_id") or entry.get("fileId")
-        if fid:
-            ids.append(fid)
-
-    for entry in message.get("attachments") or []:
-        fid = entry.get("file_id") or entry.get("fileId")
-        if fid:
-            ids.append(fid)
+    for field in ("files", "attachments"):
+        for entry in message.get(field) or []:
+            fid = entry.get("file_id") or entry.get("fileId") or entry.get("id")
+            if fid:
+                ids.append(fid)
 
     return ids
 
@@ -816,7 +815,7 @@ def _import_chat_message(
     parent_id = None
     if (
         parent_ext_id
-        and parent_ext_id != "00000000-0000-0000-0000-000000000000"
+        and parent_ext_id != NULL_UUID
         and parent_ext_id in message_id_map
     ):
         parent_id = message_id_map[parent_ext_id]
@@ -827,16 +826,7 @@ def _import_chat_message(
     citations_payload: dict[str, Any] = {}
     message_files_payload: list[dict[str, Any]] = []
     if upload_files:
-        file_sources: list[str] = []
-        for field in ("files", "attachments"):
-            for entry in message.get(field) or []:
-                file_identifier = (
-                    entry.get("file_id") or entry.get("fileId") or entry.get("id")
-                )
-                if file_identifier:
-                    file_sources.append(file_identifier)
-
-        for file_identifier in file_sources:
+        for file_identifier in _extract_message_file_ids(message):
             uploaded = get_or_upload_file(file_identifier)
             if not uploaded:
                 continue
