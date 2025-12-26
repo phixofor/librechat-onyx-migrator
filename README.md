@@ -9,6 +9,15 @@ https://github.com/openai/codex
 
 This project is "feature" complete from my perspective. Feel free to fork and adjust to your pleasure. 
 
+Compatibility
+-------------
+Tested with **Onyx 2.5.x** and **LibreChat 0.8.1** only.
+
+Prerequisites
+-------------
+- To run the full pipeline (create users + export + import), you need access to **LibreChat MongoDB** and **Onyx** (API + Postgres).
+- `import-chats` itself does not need LibreChat DB access if you already have an exported bundle on disk.
+
 Environment
 -----------
 1. Copy `.env.example` to `.env` (or reuse an existing file) so the following variables are available:

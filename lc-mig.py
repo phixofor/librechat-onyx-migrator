@@ -835,8 +835,7 @@ def _import_chat_message(
                     # `chat_message.files` consumers may rely on both keys.
                     "id": uploaded["user_file_id"],
                     "name": uploaded["name"],
-                    "type": uploaded.get("chat_file_type")
-                    or _guess_chat_file_type(uploaded.get("content_type")),
+                    "type": uploaded["chat_file_type"],
                     "user_file_id": uploaded["user_file_id"],
                     "file_id": uploaded["file_id"],
                     "librechat_file_id": uploaded["librechat_file_id"],
