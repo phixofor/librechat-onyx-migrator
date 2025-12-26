@@ -4,8 +4,9 @@ exports_*/
 __pycache__/
 *.pyc
 deployment/docker-compose.override.yml
-.beads/
 *.jsonl
+/.beads/*
+!/.beads/issues.jsonl
 # Keep AI agent guidelines out of git unless explicitly added with -f
 # AGENTS.md
 .env
