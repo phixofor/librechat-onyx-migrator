@@ -832,6 +832,7 @@ def _import_chat_message(
                 continue
             message_files_payload.append(
                 {
+                    # `chat_message.files` consumers may rely on both keys.
                     "id": uploaded["user_file_id"],
                     "name": uploaded["name"],
                     "type": uploaded.get("chat_file_type")
@@ -956,6 +957,7 @@ def import_chats(args):
     stats = {
         "processed": 0,
         "imported": 0,
+        "failed": 0,
         "skipped_branching": 0,
         "skipped_existing": 0,
         "dry_run_conversations": 0,
@@ -1169,98 +1171,115 @@ def import_chats(args):
                 )
                 continue
 
-            cursor.execute(
-                "SELECT 1 FROM chat_session WHERE id = %s",
-                (variant_uuid_str,),
-            )
-            if cursor.fetchone():
-                stats["skipped_existing"] += 1
+            imported_in_branch = 0
+            try:
+                cursor.execute(
+                    "SELECT 1 FROM chat_session WHERE id = %s",
+                    (variant_uuid_str,),
+                )
+                if cursor.fetchone():
+                    stats["skipped_existing"] += 1
+                    if conn:
+                        conn.rollback()
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO chat_session (
+                        id, user_id, description, deleted, shared_status,
+                        time_created, time_updated, persona_id, llm_override,
+                        prompt_override, onyxbot_flow, current_alternate_model,
+                        temperature_override, project_id
+                    ) VALUES (
+                        %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
+                        %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
+                        %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
+                        %(temperature_override)s, %(project_id)s
+                    )
+                    """,
+                    {
+                        "id": variant_uuid_str,
+                        "user_id": user_id,
+                        "description": description + description_suffix,
+                        "deleted": deleted,
+                        "shared_status": shared_status,
+                        "time_created": created_at,
+                        "time_updated": updated_at,
+                        "persona_id": persona_id,
+                        "llm_override": json.dumps(llm_override),
+                        "prompt_override": json.dumps(prompt_override),
+                        "onyxbot_flow": False,
+                        "current_alternate_model": current_alternate_model,
+                        "temperature_override": temperature_override,
+                        "project_id": None,
+                    },
+                )
+
+                session_intro = (
+                    f"Imported from LibreChat conversation {conversation.get('conversationId')} "
+                    f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
+                )
+                if is_branch:
+                    session_intro += f" Branch #{branch_index} of {branch_total}."
+                cursor.execute(
+                    """
+                    INSERT INTO chat_message (
+                        message, message_type, time_sent, token_count,
+                        parent_message, chat_session_id, citations, files,
+                        error, rephrased_query, alternate_assistant_id,
+                        overridden_model, is_agentic
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        session_intro,
+                        "SYSTEM",
+                        created_at,
+                        0,
+                        None,
+                        variant_uuid_str,
+                        json.dumps({}),
+                        None,
+                        None,
+                        None,
+                        None,
+                        conversation.get("model"),
+                        False,
+                    ),
+                )
+                row = cursor.fetchone()
+                system_message_id = row["id"] if isinstance(row, dict) else row[0]
+
+                message_id_map: dict[str, int] = {}
+                previous_id = system_message_id
+
+                for message in variant_messages:
+                    previous_id = _import_chat_message(
+                        cursor=cursor,
+                        message=message,
+                        message_id_map=message_id_map,
+                        previous_id=previous_id,
+                        variant_uuid_str=variant_uuid_str,
+                        upload_files=upload_files,
+                        get_or_upload_file=get_or_upload_file,
+                    )
+                    imported_in_branch += 1
+
+                if conn:
+                    conn.commit()
+                stats["imported"] += imported_in_branch
+            except Exception as exc:
+                if conn:
+                    conn.rollback()
+                label = (
+                    f"{variant_uuid_str} (branch #{branch_index})"
+                    if is_branch
+                    else variant_uuid_str
+                )
+                print(f"[error] Failed to import conversation {label}: {exc}")
+                stats["failed"] += 1
                 continue
-
-            cursor.execute(
-                """
-                INSERT INTO chat_session (
-                    id, user_id, description, deleted, shared_status,
-                    time_created, time_updated, persona_id, llm_override,
-                    prompt_override, onyxbot_flow, current_alternate_model,
-                    temperature_override, project_id
-                ) VALUES (
-                    %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
-                    %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
-                    %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
-                    %(temperature_override)s, %(project_id)s
-                )
-                """,
-                {
-                    "id": variant_uuid_str,
-                    "user_id": user_id,
-                    "description": description + description_suffix,
-                    "deleted": deleted,
-                    "shared_status": shared_status,
-                    "time_created": created_at,
-                    "time_updated": updated_at,
-                    "persona_id": persona_id,
-                    "llm_override": json.dumps(llm_override),
-                    "prompt_override": json.dumps(prompt_override),
-                    "onyxbot_flow": False,
-                    "current_alternate_model": current_alternate_model,
-                    "temperature_override": temperature_override,
-                    "project_id": None,
-                },
-            )
-
-            session_intro = (
-                f"Imported from LibreChat conversation {conversation.get('conversationId')} "
-                f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
-            )
-            if is_branch:
-                session_intro += f" Branch #{branch_index} of {branch_total}."
-            cursor.execute(
-                """
-                INSERT INTO chat_message (
-                    message, message_type, time_sent, token_count,
-                    parent_message, chat_session_id, citations, files,
-                    error, rephrased_query, alternate_assistant_id,
-                    overridden_model, is_agentic
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    session_intro,
-                    "SYSTEM",
-                    created_at,
-                    0,
-                    None,
-                    variant_uuid_str,
-                    json.dumps({}),
-                    None,
-                    None,
-                    None,
-                    None,
-                    conversation.get("model"),
-                    False,
-                ),
-            )
-            row = cursor.fetchone()
-            system_message_id = row["id"] if isinstance(row, dict) else row[0]
-
-            message_id_map: dict[str, int] = {}
-            previous_id = system_message_id
-
-            for message in variant_messages:
-                previous_id = _import_chat_message(
-                    cursor=cursor,
-                    message=message,
-                    message_id_map=message_id_map,
-                    previous_id=previous_id,
-                    variant_uuid_str=variant_uuid_str,
-                    upload_files=upload_files,
-                    get_or_upload_file=get_or_upload_file,
-                )
-                stats["imported"] += 1
-            if conn:
-                conn.commit()
 
     if cursor:
         cursor.close()
