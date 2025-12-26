@@ -26,6 +26,9 @@ except ImportError:  # pragma: no cover - optional dependency
     dict_row = None
 
 
+NULL_UUID = "00000000-0000-0000-0000-000000000000"
+
+
 def load_env(path: str = ".env"):
     if not os.path.exists(path):
         return
@@ -183,15 +186,11 @@ def _normalize_doc(doc: dict[str, Any]) -> dict[str, Any]:
 def _extract_message_file_ids(message: dict[str, Any]) -> list[str]:
     ids: list[str] = []
 
-    for entry in message.get("files") or []:
-        fid = entry.get("file_id") or entry.get("fileId")
-        if fid:
-            ids.append(fid)
-
-    for entry in message.get("attachments") or []:
-        fid = entry.get("file_id") or entry.get("fileId")
-        if fid:
-            ids.append(fid)
+    for field in ("files", "attachments"):
+        for entry in message.get(field) or []:
+            fid = entry.get("file_id") or entry.get("fileId") or entry.get("id")
+            if fid:
+                ids.append(fid)
 
     return ids
 
@@ -794,6 +793,101 @@ def _resolve_file_source(bundle_root: Path, entry: dict[str, Any]) -> Path | Non
     return None
 
 
+def _import_chat_message(
+    *,
+    cursor: Any,
+    message: dict[str, Any],
+    message_id_map: dict[str, int],
+    previous_id: int,
+    variant_uuid_str: str,
+    upload_files: bool,
+    get_or_upload_file: Any,
+) -> int:
+    message_id = message.get("messageId")
+    time_sent = _parse_iso_datetime(message.get("createdAt"))
+    message_type = "USER" if message.get("isCreatedByUser") else "ASSISTANT"
+    text = _message_text_from_record(message)
+    if not text:
+        text = "(empty message)"
+    token_count = int(message.get("tokenCount") or 0)
+    parent_ext_id = message.get("parentMessageId")
+
+    parent_id = None
+    if (
+        parent_ext_id
+        and parent_ext_id != NULL_UUID
+        and parent_ext_id in message_id_map
+    ):
+        parent_id = message_id_map[parent_ext_id]
+    else:
+        parent_id = previous_id
+
+    metadata_blob = _message_metadata_payload(message)
+    citations_payload: dict[str, Any] = {}
+    message_files_payload: list[dict[str, Any]] = []
+    if upload_files:
+        for file_identifier in _extract_message_file_ids(message):
+            uploaded = get_or_upload_file(file_identifier)
+            if not uploaded:
+                continue
+            message_files_payload.append(
+                {
+                    # `chat_message.files` consumers may rely on both keys.
+                    "id": uploaded["user_file_id"],
+                    "name": uploaded["name"],
+                    "type": uploaded["chat_file_type"],
+                    "user_file_id": uploaded["user_file_id"],
+                    "file_id": uploaded["file_id"],
+                    "librechat_file_id": uploaded["librechat_file_id"],
+                }
+            )
+
+    cursor.execute(
+        """
+        INSERT INTO chat_message (
+            message, message_type, time_sent, token_count,
+            parent_message, chat_session_id, citations, files,
+            error, rephrased_query, alternate_assistant_id,
+            overridden_model, is_agentic
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            text,
+            message_type,
+            time_sent,
+            token_count,
+            parent_id,
+            variant_uuid_str,
+            json.dumps(citations_payload),
+            json.dumps(message_files_payload) if message_files_payload else None,
+            str(message.get("error")) if message.get("error") else None,
+            None,
+            None,
+            message.get("model"),
+            False,
+        ),
+    )
+    row = cursor.fetchone()
+    inserted_id = row["id"] if isinstance(row, dict) else row[0]
+    cursor.execute(
+        """
+        INSERT INTO librechat_message_metadata (chat_message_id, metadata)
+        VALUES (%s, %s)
+        ON CONFLICT (chat_message_id) DO UPDATE SET metadata = EXCLUDED.metadata
+        """,
+        (inserted_id, json.dumps(metadata_blob)),
+    )
+    message_id_map[message_id] = inserted_id
+    if parent_id:
+        cursor.execute(
+            "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
+            (inserted_id, parent_id),
+        )
+    return inserted_id
+
+
 def import_chats(args):
     load_env(".env")
     bundle_path = Path(args.bundle_path).expanduser()
@@ -862,6 +956,7 @@ def import_chats(args):
     stats = {
         "processed": 0,
         "imported": 0,
+        "failed": 0,
         "skipped_branching": 0,
         "skipped_existing": 0,
         "dry_run_conversations": 0,
@@ -1075,182 +1170,119 @@ def import_chats(args):
                 )
                 continue
 
-            cursor.execute(
-                "SELECT 1 FROM chat_session WHERE id = %s",
-                (variant_uuid_str,),
-            )
-            if cursor.fetchone():
-                stats["skipped_existing"] += 1
-                continue
-
-            cursor.execute(
-                """
-                INSERT INTO chat_session (
-                    id, user_id, description, deleted, shared_status,
-                    time_created, time_updated, persona_id, llm_override,
-                    prompt_override, onyxbot_flow, current_alternate_model,
-                    temperature_override, project_id
-                ) VALUES (
-                    %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
-                    %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
-                    %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
-                    %(temperature_override)s, %(project_id)s
-                )
-                """,
-                {
-                    "id": variant_uuid_str,
-                    "user_id": user_id,
-                    "description": description + description_suffix,
-                    "deleted": deleted,
-                    "shared_status": shared_status,
-                    "time_created": created_at,
-                    "time_updated": updated_at,
-                    "persona_id": persona_id,
-                    "llm_override": json.dumps(llm_override),
-                    "prompt_override": json.dumps(prompt_override),
-                    "onyxbot_flow": False,
-                    "current_alternate_model": current_alternate_model,
-                    "temperature_override": temperature_override,
-                    "project_id": None,
-                },
-            )
-
-            session_intro = (
-                f"Imported from LibreChat conversation {conversation.get('conversationId')} "
-                f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
-            )
-            if is_branch:
-                session_intro += f" Branch #{branch_index} of {branch_total}."
-            cursor.execute(
-                """
-                INSERT INTO chat_message (
-                    message, message_type, time_sent, token_count,
-                    parent_message, chat_session_id, citations, files,
-                    error, rephrased_query, alternate_assistant_id,
-                    overridden_model, is_agentic
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    session_intro,
-                    "SYSTEM",
-                    created_at,
-                    0,
-                    None,
-                    variant_uuid_str,
-                    json.dumps({}),
-                    None,
-                    None,
-                    None,
-                    None,
-                    conversation.get("model"),
-                    False,
-                ),
-            )
-            row = cursor.fetchone()
-            system_message_id = row["id"] if isinstance(row, dict) else row[0]
-
-            message_id_map: dict[str, int] = {}
-            previous_id = system_message_id
-
-            for message in variant_messages:
-                message_id = message.get("messageId")
-                time_sent = _parse_iso_datetime(message.get("createdAt"))
-                message_type = "USER" if message.get("isCreatedByUser") else "ASSISTANT"
-                text = _message_text_from_record(message)
-                if not text:
-                    text = "(empty message)"
-                token_count = int(message.get("tokenCount") or 0)
-                parent_ext_id = message.get("parentMessageId")
-            parent_id = None
-            if (
-                parent_ext_id
-                and parent_ext_id != "00000000-0000-0000-0000-000000000000"
-                and parent_ext_id in message_id_map
-            ):
-                parent_id = message_id_map[parent_ext_id]
-            else:
-                parent_id = previous_id
-            metadata_blob = _message_metadata_payload(message)
-            citations_payload: dict[str, Any] = {}
-            message_files_payload: list[dict[str, Any]] = []
-            if upload_files:
-                file_sources: list[str] = []
-                for field in ("files", "attachments"):
-                    for entry in message.get(field) or []:
-                        file_identifier = (
-                            entry.get("file_id")
-                            or entry.get("fileId")
-                            or entry.get("id")
-                        )
-                        if file_identifier:
-                            file_sources.append(file_identifier)
-
-                for file_identifier in file_sources:
-                    uploaded = get_or_upload_file(file_identifier)
-                    if not uploaded:
-                        continue
-                    message_files_payload.append(
-                        {
-                            "id": uploaded["user_file_id"],
-                            "name": uploaded["name"],
-                            "type": uploaded.get("chat_file_type")
-                            or _guess_chat_file_type(uploaded.get("content_type")),
-                            "user_file_id": uploaded["user_file_id"],
-                            "file_id": uploaded["file_id"],
-                            "librechat_file_id": uploaded["librechat_file_id"],
-                        }
-                    )
-
-            cursor.execute(
-                """
-                INSERT INTO chat_message (
-                    message, message_type, time_sent, token_count,
-                    parent_message, chat_session_id, citations, files,
-                    error, rephrased_query, alternate_assistant_id,
-                    overridden_model, is_agentic
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    text,
-                    message_type,
-                    time_sent,
-                    token_count,
-                    parent_id,
-                    variant_uuid_str,
-                    json.dumps(citations_payload),
-                    json.dumps(message_files_payload) if message_files_payload else None,
-                    str(message.get("error")) if message.get("error") else None,
-                    None,
-                    None,
-                    message.get("model"),
-                    False,
-                ),
-            )
-            row = cursor.fetchone()
-            inserted_id = row["id"] if isinstance(row, dict) else row[0]
-            cursor.execute(
-                """
-                INSERT INTO librechat_message_metadata (chat_message_id, metadata)
-                VALUES (%s, %s)
-                ON CONFLICT (chat_message_id) DO UPDATE SET metadata = EXCLUDED.metadata
-                """,
-                (inserted_id, json.dumps(metadata_blob)),
-            )
-            message_id_map[message_id] = inserted_id
-            previous_id = inserted_id
-            if parent_id:
+            imported_in_branch = 0
+            try:
                 cursor.execute(
-                    "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
-                    (inserted_id, parent_id),
+                    "SELECT 1 FROM chat_session WHERE id = %s",
+                    (variant_uuid_str,),
+                )
+                if cursor.fetchone():
+                    stats["skipped_existing"] += 1
+                    if conn:
+                        conn.rollback()
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO chat_session (
+                        id, user_id, description, deleted, shared_status,
+                        time_created, time_updated, persona_id, llm_override,
+                        prompt_override, onyxbot_flow, current_alternate_model,
+                        temperature_override, project_id
+                    ) VALUES (
+                        %(id)s, %(user_id)s, %(description)s, %(deleted)s, %(shared_status)s,
+                        %(time_created)s, %(time_updated)s, %(persona_id)s, %(llm_override)s,
+                        %(prompt_override)s, %(onyxbot_flow)s, %(current_alternate_model)s,
+                        %(temperature_override)s, %(project_id)s
+                    )
+                    """,
+                    {
+                        "id": variant_uuid_str,
+                        "user_id": user_id,
+                        "description": description + description_suffix,
+                        "deleted": deleted,
+                        "shared_status": shared_status,
+                        "time_created": created_at,
+                        "time_updated": updated_at,
+                        "persona_id": persona_id,
+                        "llm_override": json.dumps(llm_override),
+                        "prompt_override": json.dumps(prompt_override),
+                        "onyxbot_flow": False,
+                        "current_alternate_model": current_alternate_model,
+                        "temperature_override": temperature_override,
+                        "project_id": None,
+                    },
                 )
 
-            stats["imported"] += 1
-            if conn:
-                conn.commit()
+                session_intro = (
+                    f"Imported from LibreChat conversation {conversation.get('conversationId')} "
+                    f"(endpoint={conversation.get('endpoint')}, model={conversation.get('model')})."
+                )
+                if is_branch:
+                    session_intro += f" Branch #{branch_index} of {branch_total}."
+                cursor.execute(
+                    """
+                    INSERT INTO chat_message (
+                        message, message_type, time_sent, token_count,
+                        parent_message, chat_session_id, citations, files,
+                        error, rephrased_query, alternate_assistant_id,
+                        overridden_model, is_agentic
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        session_intro,
+                        "SYSTEM",
+                        created_at,
+                        0,
+                        None,
+                        variant_uuid_str,
+                        json.dumps({}),
+                        None,
+                        None,
+                        None,
+                        None,
+                        conversation.get("model"),
+                        False,
+                    ),
+                )
+                row = cursor.fetchone()
+                system_message_id = row["id"] if isinstance(row, dict) else row[0]
+
+                message_id_map: dict[str, int] = {}
+                previous_id = system_message_id
+
+                for message in variant_messages:
+                    previous_id = _import_chat_message(
+                        cursor=cursor,
+                        message=message,
+                        message_id_map=message_id_map,
+                        previous_id=previous_id,
+                        variant_uuid_str=variant_uuid_str,
+                        upload_files=upload_files,
+                        get_or_upload_file=get_or_upload_file,
+                    )
+                    imported_in_branch += 1
+
+                if conn:
+                    conn.commit()
+                stats["imported"] += imported_in_branch
+            except (KeyboardInterrupt, SystemExit):
+                if conn:
+                    conn.rollback()
+                raise
+            except Exception as exc:
+                if conn:
+                    conn.rollback()
+                label = (
+                    f"{variant_uuid_str} (branch #{branch_index})"
+                    if is_branch
+                    else variant_uuid_str
+                )
+                print(f"[error] Failed to import conversation {label}: {exc}")
+                stats["failed"] += 1
+                continue
 
     if cursor:
         cursor.close()
