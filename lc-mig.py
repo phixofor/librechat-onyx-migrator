@@ -1268,6 +1268,10 @@ def import_chats(args):
                 if conn:
                     conn.commit()
                 stats["imported"] += imported_in_branch
+            except (KeyboardInterrupt, SystemExit):
+                if conn:
+                    conn.rollback()
+                raise
             except Exception as exc:
                 if conn:
                     conn.rollback()
