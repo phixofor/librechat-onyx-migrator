@@ -1163,94 +1163,96 @@ def import_chats(args):
                     text = "(empty message)"
                 token_count = int(message.get("tokenCount") or 0)
                 parent_ext_id = message.get("parentMessageId")
-            parent_id = None
-            if (
-                parent_ext_id
-                and parent_ext_id != "00000000-0000-0000-0000-000000000000"
-                and parent_ext_id in message_id_map
-            ):
-                parent_id = message_id_map[parent_ext_id]
-            else:
-                parent_id = previous_id
-            metadata_blob = _message_metadata_payload(message)
-            citations_payload: dict[str, Any] = {}
-            message_files_payload: list[dict[str, Any]] = []
-            if upload_files:
-                file_sources: list[str] = []
-                for field in ("files", "attachments"):
-                    for entry in message.get(field) or []:
-                        file_identifier = (
-                            entry.get("file_id")
-                            or entry.get("fileId")
-                            or entry.get("id")
-                        )
-                        if file_identifier:
-                            file_sources.append(file_identifier)
+                parent_id = None
+                if (
+                    parent_ext_id
+                    and parent_ext_id != "00000000-0000-0000-0000-000000000000"
+                    and parent_ext_id in message_id_map
+                ):
+                    parent_id = message_id_map[parent_ext_id]
+                else:
+                    parent_id = previous_id
+                metadata_blob = _message_metadata_payload(message)
+                citations_payload: dict[str, Any] = {}
+                message_files_payload: list[dict[str, Any]] = []
+                if upload_files:
+                    file_sources: list[str] = []
+                    for field in ("files", "attachments"):
+                        for entry in message.get(field) or []:
+                            file_identifier = (
+                                entry.get("file_id")
+                                or entry.get("fileId")
+                                or entry.get("id")
+                            )
+                            if file_identifier:
+                                file_sources.append(file_identifier)
 
-                for file_identifier in file_sources:
-                    uploaded = get_or_upload_file(file_identifier)
-                    if not uploaded:
-                        continue
-                    message_files_payload.append(
-                        {
-                            "id": uploaded["user_file_id"],
-                            "name": uploaded["name"],
-                            "type": uploaded.get("chat_file_type")
-                            or _guess_chat_file_type(uploaded.get("content_type")),
-                            "user_file_id": uploaded["user_file_id"],
-                            "file_id": uploaded["file_id"],
-                            "librechat_file_id": uploaded["librechat_file_id"],
-                        }
+                    for file_identifier in file_sources:
+                        uploaded = get_or_upload_file(file_identifier)
+                        if not uploaded:
+                            continue
+                        message_files_payload.append(
+                            {
+                                "id": uploaded["user_file_id"],
+                                "name": uploaded["name"],
+                                "type": uploaded.get("chat_file_type")
+                                or _guess_chat_file_type(uploaded.get("content_type")),
+                                "user_file_id": uploaded["user_file_id"],
+                                "file_id": uploaded["file_id"],
+                                "librechat_file_id": uploaded["librechat_file_id"],
+                            }
+                        )
+
+                cursor.execute(
+                    """
+                    INSERT INTO chat_message (
+                        message, message_type, time_sent, token_count,
+                        parent_message, chat_session_id, citations, files,
+                        error, rephrased_query, alternate_assistant_id,
+                        overridden_model, is_agentic
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        text,
+                        message_type,
+                        time_sent,
+                        token_count,
+                        parent_id,
+                        variant_uuid_str,
+                        json.dumps(citations_payload),
+                        json.dumps(message_files_payload)
+                        if message_files_payload
+                        else None,
+                        str(message.get("error")) if message.get("error") else None,
+                        None,
+                        None,
+                        message.get("model"),
+                        False,
+                    ),
+                )
+                row = cursor.fetchone()
+                inserted_id = row["id"] if isinstance(row, dict) else row[0]
+                cursor.execute(
+                    """
+                    INSERT INTO librechat_message_metadata (chat_message_id, metadata)
+                    VALUES (%s, %s)
+                    ON CONFLICT (chat_message_id) DO UPDATE SET metadata = EXCLUDED.metadata
+                    """,
+                    (inserted_id, json.dumps(metadata_blob)),
+                )
+                message_id_map[message_id] = inserted_id
+                previous_id = inserted_id
+                if parent_id:
+                    cursor.execute(
+                        "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
+                        (inserted_id, parent_id),
                     )
 
-            cursor.execute(
-                """
-                INSERT INTO chat_message (
-                    message, message_type, time_sent, token_count,
-                    parent_message, chat_session_id, citations, files,
-                    error, rephrased_query, alternate_assistant_id,
-                    overridden_model, is_agentic
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    text,
-                    message_type,
-                    time_sent,
-                    token_count,
-                    parent_id,
-                    variant_uuid_str,
-                    json.dumps(citations_payload),
-                    json.dumps(message_files_payload) if message_files_payload else None,
-                    str(message.get("error")) if message.get("error") else None,
-                    None,
-                    None,
-                    message.get("model"),
-                    False,
-                ),
-            )
-            row = cursor.fetchone()
-            inserted_id = row["id"] if isinstance(row, dict) else row[0]
-            cursor.execute(
-                """
-                INSERT INTO librechat_message_metadata (chat_message_id, metadata)
-                VALUES (%s, %s)
-                ON CONFLICT (chat_message_id) DO UPDATE SET metadata = EXCLUDED.metadata
-                """,
-                (inserted_id, json.dumps(metadata_blob)),
-            )
-            message_id_map[message_id] = inserted_id
-            previous_id = inserted_id
-            if parent_id:
-                cursor.execute(
-                    "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
-                    (inserted_id, parent_id),
-                )
-
-            stats["imported"] += 1
-            if conn:
-                conn.commit()
+                stats["imported"] += 1
+                if conn:
+                    conn.commit()
 
     if cursor:
         cursor.close()
