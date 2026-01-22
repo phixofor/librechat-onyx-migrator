@@ -992,7 +992,8 @@ def import_chats(args):
             return None
 
         metadata = manifest.get("metadata") or {}
-        file_name = metadata.get("filename") or metadata.get("name") or src_path.name
+        preferred_name = metadata.get("filename") or metadata.get("name")
+        file_name = preferred_name or src_path.name
         content_type = (
             metadata.get("type")
             or metadata.get("content_type")
@@ -1066,7 +1067,7 @@ def import_chats(args):
         info = {
             "file_id": snapshot.get("file_id") or user_file_id,
             "user_file_id": user_file_id,
-            "name": snapshot.get("name") or file_name,
+            "name": file_name,
             "content_type": resolved_content_type,
             "chat_file_type": chat_file_type
             or _guess_chat_file_type(resolved_content_type),
