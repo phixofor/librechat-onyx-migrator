@@ -846,11 +846,9 @@ def _import_chat_message(
         """
         INSERT INTO chat_message (
             message, message_type, time_sent, token_count,
-            parent_message, chat_session_id, citations, files,
-            error, rephrased_query, alternate_assistant_id,
-            overridden_model, is_agentic
+            parent_message_id, chat_session_id, citations, files, error
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -863,10 +861,6 @@ def _import_chat_message(
             json.dumps(citations_payload),
             json.dumps(message_files_payload) if message_files_payload else None,
             str(message.get("error")) if message.get("error") else None,
-            None,
-            None,
-            message.get("model"),
-            False,
         ),
     )
     row = cursor.fetchone()
@@ -882,7 +876,7 @@ def _import_chat_message(
     message_id_map[message_id] = inserted_id
     if parent_id:
         cursor.execute(
-            "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
+            "UPDATE chat_message SET latest_child_message_id = %s WHERE id = %s",
             (inserted_id, parent_id),
         )
     return inserted_id
@@ -992,7 +986,8 @@ def import_chats(args):
             return None
 
         metadata = manifest.get("metadata") or {}
-        file_name = metadata.get("filename") or metadata.get("name") or src_path.name
+        preferred_name = metadata.get("filename") or metadata.get("name")
+        file_name = preferred_name or src_path.name
         content_type = (
             metadata.get("type")
             or metadata.get("content_type")
@@ -1066,7 +1061,7 @@ def import_chats(args):
         info = {
             "file_id": snapshot.get("file_id") or user_file_id,
             "user_file_id": user_file_id,
-            "name": snapshot.get("name") or file_name,
+            "name": file_name,
             "content_type": resolved_content_type,
             "chat_file_type": chat_file_type
             or _guess_chat_file_type(resolved_content_type),
@@ -1224,11 +1219,9 @@ def import_chats(args):
                     """
                     INSERT INTO chat_message (
                         message, message_type, time_sent, token_count,
-                        parent_message, chat_session_id, citations, files,
-                        error, rephrased_query, alternate_assistant_id,
-                        overridden_model, is_agentic
+                        parent_message_id, chat_session_id, citations, files, error
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -1241,10 +1234,6 @@ def import_chats(args):
                         json.dumps({}),
                         None,
                         None,
-                        None,
-                        None,
-                        conversation.get("model"),
-                        False,
                     ),
                 )
                 row = cursor.fetchone()
@@ -1334,7 +1323,7 @@ def repair_latest_child(args):
     for session_id in session_ids:
         cursor.execute(
             """
-            SELECT id, parent_message
+            SELECT id, parent_message_id
             FROM chat_message
             WHERE chat_session_id = %s
             ORDER BY time_sent ASC, id ASC
@@ -1344,14 +1333,14 @@ def repair_latest_child(args):
         rows = cursor.fetchall()
         parent_children: dict[int, list[int]] = {}
         for row in rows:
-            parent_id = row["parent_message"] if isinstance(row, dict) else row[1]
+            parent_id = row["parent_message_id"] if isinstance(row, dict) else row[1]
             child_id = row["id"] if isinstance(row, dict) else row[0]
             if parent_id:
                 parent_children.setdefault(parent_id, []).append(child_id)
 
         for parent_id, children in parent_children.items():
             cursor.execute(
-                "UPDATE chat_message SET latest_child_message = %s WHERE id = %s",
+                "UPDATE chat_message SET latest_child_message_id = %s WHERE id = %s",
                 (children[-1], parent_id),
             )
         if parent_children:
@@ -1360,7 +1349,7 @@ def repair_latest_child(args):
     conn.commit()
     cursor.close()
     conn.close()
-    print(f"Updated latest_child_message for {repaired} chat sessions.")
+    print(f"Updated latest_child_message_id for {repaired} chat sessions.")
 
 
 def repair_citations(args):
@@ -1612,7 +1601,7 @@ def main():
 
     repair_cmd = sub.add_parser(
         "repair-latest-child",
-        help="Backfill chat_message.latest_child_message for existing sessions",
+        help="Backfill chat_message.latest_child_message_id for existing sessions",
     )
     repair_cmd.add_argument(
         "--chat-session-id",
